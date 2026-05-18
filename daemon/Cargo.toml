@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = "0.7"
+base64 = "0.22"
 keystore = { path = "../vendor/rustpush/keystore" }
 openssl = { version = "0.10.56", features = ["vendored"] }
 plist = "1.7"

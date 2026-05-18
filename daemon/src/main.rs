@@ -96,6 +96,23 @@ fn init_file_keystore(data_dir: &Path) {
     });
 }
 
+fn seed_hwconfig_from_env(data_dir: &Path) -> Result<(), String> {
+    let hwconfig_path = path(data_dir, "hwconfig.plist");
+    if hwconfig_path.exists() {
+        return Ok(());
+    }
+
+    let Ok(base64_value) = env::var("HWCONFIG_PLIST_BASE64") else {
+        return Ok(());
+    };
+
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let decoded = STANDARD
+        .decode(base64_value)
+        .map_err(|error| format!("invalid HWCONFIG_PLIST_BASE64: {error}"))?;
+    fs::write(hwconfig_path, decoded).map_err(|error| error.to_string())
+}
+
 async fn boot_from_saved_state(data_dir: &Path) -> Result<Option<Runtime>, String> {
     let Some(config) = load_plist::<MacOSConfig>(&path(data_dir, "hwconfig.plist")) else {
         return Ok(None);
@@ -354,6 +371,7 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/app/data"));
     fs::create_dir_all(&data_dir).expect("failed to create data dir");
+    seed_hwconfig_from_env(&data_dir).expect("failed to seed hwconfig");
     init_file_keystore(&data_dir);
 
     let runtime = boot_from_saved_state(&data_dir)
