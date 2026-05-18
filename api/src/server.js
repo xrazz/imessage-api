@@ -83,6 +83,11 @@ const server = http.createServer(async (req, res) => {
       return json(res, result.status, result.body);
     }
 
+    if (req.method === "POST" && req.url === "/admin/provision/sms") {
+      const result = await forward("/provision/sms", {});
+      return json(res, result.status, result.body);
+    }
+
     return json(res, 404, { ok: false, error: "not_found" });
   } catch (error) {
     return json(res, 500, {

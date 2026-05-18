@@ -13,7 +13,7 @@ use rustpush::{
     authenticate_apple, default_provider, login_apple_delegates, macos::MacOSConfig, register,
     AppleAccount, APSConnection, APSConnectionResource, APSState, ConversationData,
     DefaultAnisetteProvider, IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, LoginState,
-    MADRID_SERVICE, Message, MessageInst, MessageType, NormalMessage, OSConfig,
+    MADRID_SERVICE, Message, MessageInst, MessageType, NormalMessage, OSConfig, VerifyBody,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -43,6 +43,7 @@ struct PendingLogin {
     account: AppleAccount<DefaultAnisetteProvider>,
     connection: APSConnection,
     config: Arc<MacOSConfig>,
+    sms_verify_body: Option<VerifyBody>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -215,6 +216,7 @@ async fn begin_provision(
             account,
             connection,
             config,
+            sms_verify_body: None,
         }),
         LoginState::NeedsDevice2FA => {
             account
@@ -225,6 +227,7 @@ async fn begin_provision(
                 account,
                 connection,
                 config,
+                sms_verify_body: None,
             })
         }
         other => Err(format!("unsupported login state: {other:?}")),
@@ -236,12 +239,21 @@ async fn finish_provision(
     mut pending: PendingLogin,
     code: String,
 ) -> Result<Runtime, String> {
-    match pending
-        .account
-        .verify_2fa(code)
-        .await
-        .map_err(|error| error.to_string())?
-    {
+    let login_state = if let Some(body) = pending.sms_verify_body.take() {
+        pending
+            .account
+            .verify_sms_2fa(code, body)
+            .await
+            .map_err(|error| error.to_string())?
+    } else {
+        pending
+            .account
+            .verify_2fa(code)
+            .await
+            .map_err(|error| error.to_string())?
+    };
+
+    match login_state {
         LoginState::LoggedIn => {}
         other => return Err(format!("2FA did not complete login: {other:?}")),
     }
@@ -280,6 +292,69 @@ async fn finish_provision(
     };
     save_plist(&path(data_dir, "config.plist"), &saved)?;
     build_runtime(pending.connection, pending.config, saved, data_dir).await
+}
+
+async fn request_sms_code(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let mut guard = state.pending_login.lock().await;
+    let Some(pending) = guard.as_mut() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse {
+                ok: false,
+                message_id: None,
+                error: Some("no_pending_login"),
+                message: Some("start provisioning first".to_string()),
+            }),
+        );
+    };
+
+    let result = async {
+        let extras = pending
+            .account
+            .get_auth_extras()
+            .await
+            .map_err(|error| error.to_string())?;
+        let phone = extras
+            .trusted_phone_numbers
+            .first()
+            .ok_or_else(|| "no trusted phone number available".to_string())?;
+        match pending
+            .account
+            .send_sms_2fa_to_devices(phone.id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            LoginState::NeedsSMS2FAVerification(body) => {
+                pending.sms_verify_body = Some(body);
+                Ok(())
+            }
+            other => Err(format!("SMS 2FA did not start: {other:?}")),
+        }
+    }
+    .await;
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                ok: true,
+                message_id: None,
+                error: None,
+                message: Some("sms_verification_code_sent".to_string()),
+            }),
+        ),
+        Err(message) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiResponse {
+                ok: false,
+                message_id: None,
+                error: Some("sms_request_failed"),
+                message: Some(message),
+            }),
+        ),
+    }
 }
 
 async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
@@ -466,6 +541,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/provision", post(provision))
+        .route("/provision/sms", post(request_sms_code))
         .route("/provision/complete", post(complete_provision))
         .route("/send", post(send))
         .layer(TraceLayer::new_for_http())
