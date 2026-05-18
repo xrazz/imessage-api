@@ -1,0 +1,6 @@
+.git
+**/.git
+**/target
+private
+vendor/rustpush-incomplete
+.DS_Store

@@ -1,0 +1,15 @@
+# Rust
+target/
+
+## Intellij
+out/
+lib/
+.idea/
+*.ipr
+*.iws
+*.iml
+
+## OS Specific
+.DS_Store
+
+openbubbles.so

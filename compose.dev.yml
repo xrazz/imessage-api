@@ -1,0 +1,24 @@
+services:
+  daemon:
+    build:
+      context: .
+      dockerfile: daemon/Dockerfile
+    environment:
+      DATA_DIR: /app/data
+      PORT: 8080
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8080:8080"
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      PORT: 3000
+      DAEMON_URL: http://daemon:8080
+      API_KEY: local-dev-key
+    ports:
+      - "3000:3000"
+    depends_on:
+      - daemon

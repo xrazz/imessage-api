@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "macos-validation-data",
+    "open-absinthe",
+    "fairplay-certs"
+]
