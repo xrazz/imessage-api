@@ -11,9 +11,9 @@ use keystore::{
 use openssl::sha::sha256;
 use rustpush::{
     authenticate_apple, default_provider, login_apple_delegates, macos::MacOSConfig, register,
-    APSConnection, APSConnectionResource, APSState, ConversationData, IDSNGMIdentity, IDSUser,
-    IMClient, LoginDelegate, MADRID_SERVICE, Message, MessageInst, MessageType, NormalMessage,
-    OSConfig,
+    AppleAccount, APSConnection, APSConnectionResource, APSState, ConversationData,
+    DefaultAnisetteProvider, IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, LoginState,
+    MADRID_SERVICE, Message, MessageInst, MessageType, NormalMessage, OSConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,12 +30,19 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<Mutex<Option<Runtime>>>,
+    pending_login: Arc<Mutex<Option<PendingLogin>>>,
     data_dir: PathBuf,
 }
 
 struct Runtime {
     client: IMClient,
     sender_handle: String,
+}
+
+struct PendingLogin {
+    account: AppleAccount<DefaultAnisetteProvider>,
+    connection: APSConnection,
+    config: Arc<MacOSConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -55,7 +62,10 @@ struct SendRequest {
 struct ProvisionRequest {
     apple_id: String,
     password: String,
-    #[serde(default)]
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteProvisionRequest {
     two_factor_code: String,
 }
 
@@ -173,15 +183,13 @@ async fn build_runtime(
     })
 }
 
-async fn provision_runtime(
+async fn begin_provision(
     data_dir: &Path,
     request: ProvisionRequest,
-) -> Result<Runtime, String> {
-    let services = &[&MADRID_SERVICE];
+) -> Result<PendingLogin, String> {
     let config = load_plist::<MacOSConfig>(&path(data_dir, "hwconfig.plist"))
         .ok_or_else(|| "missing hwconfig.plist".to_string())?;
     let config = Arc::new(config);
-
     let (connection, error) = APSConnectionResource::new(config.clone(), None).await;
     if let Some(error) = error {
         tracing::warn!("APS created with warning: {error}");
@@ -191,43 +199,74 @@ async fn provision_runtime(
         config.get_gsa_config(&*connection.state.read().await, false),
         path(data_dir, "anisette"),
     );
-
-    let apple_id = request.apple_id.clone();
-    let password_hash = sha256(request.password.as_bytes()).to_vec();
-    let two_factor_code = request.two_factor_code.clone();
-
-    let account = rustpush::AppleAccount::login(
-        move || (apple_id.clone(), password_hash.clone()),
-        move || two_factor_code.clone(),
+    let mut account = AppleAccount::new_with_anisette(
         config.get_gsa_config(&*connection.state.read().await, false),
         anisette,
     )
-    .await
     .map_err(|error| error.to_string())?;
+    let password_hash = sha256(request.password.as_bytes()).to_vec();
+    let login_state = account
+        .login_email_pass(&request.apple_id, &password_hash)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    match login_state {
+        LoginState::LoggedIn => Ok(PendingLogin {
+            account,
+            connection,
+            config,
+        }),
+        LoginState::NeedsDevice2FA => {
+            account
+                .send_2fa_to_devices()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(PendingLogin {
+                account,
+                connection,
+                config,
+            })
+        }
+        other => Err(format!("unsupported login state: {other:?}")),
+    }
+}
+
+async fn finish_provision(
+    data_dir: &Path,
+    mut pending: PendingLogin,
+    code: String,
+) -> Result<Runtime, String> {
+    match pending
+        .account
+        .verify_2fa(code)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        LoginState::LoggedIn => {}
+        other => return Err(format!("2FA did not complete login: {other:?}")),
+    }
 
     let delegates = login_apple_delegates(
-        &account,
+        &pending.account,
         None,
-        config.as_ref(),
+        pending.config.as_ref(),
         &[LoginDelegate::IDS],
     )
     .await
     .map_err(|error| error.to_string())?;
-
     let mut users = vec![authenticate_apple(
         delegates
             .ids
             .ok_or_else(|| "missing IDS delegate".to_string())?,
-        config.as_ref(),
+        pending.config.as_ref(),
     )
     .await
     .map_err(|error| error.to_string())?];
-
     let identity = IDSNGMIdentity::new().map_err(|error| error.to_string())?;
     register(
-        config.as_ref(),
-        &*connection.state.read().await,
-        services,
+        pending.config.as_ref(),
+        &*pending.connection.state.read().await,
+        &[&MADRID_SERVICE],
         &mut users,
         &identity,
     )
@@ -235,13 +274,12 @@ async fn provision_runtime(
     .map_err(|error| error.to_string())?;
 
     let saved = SavedState {
-        push: connection.state.read().await.clone(),
+        push: pending.connection.state.read().await.clone(),
         users,
         identity,
     };
     save_plist(&path(data_dir, "config.plist"), &saved)?;
-
-    build_runtime(connection, config, saved, data_dir).await
+    build_runtime(pending.connection, pending.config, saved, data_dir).await
 }
 
 async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
@@ -274,7 +312,48 @@ async fn provision(
         );
     }
 
-    match provision_runtime(&state.data_dir, request).await {
+    match begin_provision(&state.data_dir, request).await {
+        Ok(pending) => {
+            *state.pending_login.lock().await = Some(pending);
+            (
+                StatusCode::OK,
+                Json(ApiResponse {
+                    ok: true,
+                    message_id: None,
+                    error: None,
+                    message: Some("verification_code_sent".to_string()),
+                }),
+            )
+        }
+        Err(message) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiResponse {
+                ok: false,
+                message_id: None,
+                error: Some("provision_failed"),
+                message: Some(message),
+            }),
+        ),
+    }
+}
+
+async fn complete_provision(
+    State(state): State<AppState>,
+    Json(request): Json<CompleteProvisionRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let Some(pending) = state.pending_login.lock().await.take() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse {
+                ok: false,
+                message_id: None,
+                error: Some("no_pending_login"),
+                message: Some("start provisioning first".to_string()),
+            }),
+        );
+    };
+
+    match finish_provision(&state.data_dir, pending, request.two_factor_code).await {
         Ok(runtime) => {
             *state.runtime.lock().await = Some(runtime);
             (
@@ -380,12 +459,14 @@ async fn main() {
 
     let app_state = AppState {
         runtime: Arc::new(Mutex::new(runtime)),
+        pending_login: Arc::new(Mutex::new(None)),
         data_dir,
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/provision", post(provision))
+        .route("/provision/complete", post(complete_provision))
         .route("/send", post(send))
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);

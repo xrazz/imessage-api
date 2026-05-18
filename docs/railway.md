@@ -46,7 +46,16 @@ POST /admin/provision
 Authorization: Bearer $API_KEY
 {
   "apple_id": "...",
-  "password": "...",
+  "password": "..."
+}
+```
+
+That sends a verification code to trusted devices. Then complete provisioning:
+
+```http
+POST /admin/provision/complete
+Authorization: Bearer $API_KEY
+{
   "two_factor_code": "..."
 }
 ```

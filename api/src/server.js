@@ -58,16 +58,28 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (
         typeof body.apple_id !== "string" ||
-        typeof body.password !== "string" ||
-        typeof body.two_factor_code !== "string"
+        typeof body.password !== "string"
       ) {
         return json(res, 400, {
           ok: false,
-          error: "`apple_id`, `password`, and `two_factor_code` must be strings"
+          error: "`apple_id` and `password` must be strings"
         });
       }
 
       const result = await forward("/provision", body);
+      return json(res, result.status, result.body);
+    }
+
+    if (req.method === "POST" && req.url === "/admin/provision/complete") {
+      const body = await readJson(req);
+      if (typeof body.two_factor_code !== "string") {
+        return json(res, 400, {
+          ok: false,
+          error: "`two_factor_code` must be a string"
+        });
+      }
+
+      const result = await forward("/provision/complete", body);
       return json(res, result.status, result.body);
     }
 
