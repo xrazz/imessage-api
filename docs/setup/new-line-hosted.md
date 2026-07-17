@@ -24,6 +24,8 @@ Deploy two services for the current single-line setup:
 
 For many lines, see [multi-line-backend.md](multi-line-backend.md).
 
+For the shortest copy-paste flow, see [three-step-provision.md](three-step-provision.md).
+
 ## Environment
 
 Set these on the public API service:
