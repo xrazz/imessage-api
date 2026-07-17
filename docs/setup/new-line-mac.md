@@ -35,4 +35,3 @@ Confirm the Apple ID works normally:
 2. Confirm two-factor authentication is available.
 3. Confirm the Apple ID is allowed to use iMessage/FaceTime.
 4. If this line needs a phone number handle, confirm the phone number is actually registered with iMessage. Email/password alone will usually only give an email handle.
-

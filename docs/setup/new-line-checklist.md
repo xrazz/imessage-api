@@ -20,8 +20,8 @@ base64 < private/hwconfig.plist | tr -d '\n' | pbcopy
 
 ## Hosting
 
-- [ ] Create a new daemon service for this line.
-- [ ] Attach a fresh persistent volume at `/app/data`.
+- [ ] Create or select a daemon state for this line.
+- [ ] If using the current single-line daemon, attach a fresh persistent volume at `/app/data`.
 - [ ] Set daemon env:
 
 ```text
@@ -88,6 +88,5 @@ curl -X POST "<api-url>/facetime/calls" \
 
 - Email Apple IDs usually produce `mailto:` handles.
 - Phone handles require the phone number to already be registered/entitled for iMessage.
-- Do not run two daemon instances against the same data volume.
+- Do not run two daemon instances against the same data directory.
 - Avoid aggressively provisioning many Apple IDs from the same hardware identity.
-

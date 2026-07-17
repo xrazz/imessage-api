@@ -6,23 +6,23 @@ Use one isolated daemon state per iMessage line.
 
 One line should have:
 
-- one daemon service
-- one daemon volume or data directory
+- one daemon state directory
 - one Apple ID provisioned into that daemon state
 - one `config.plist`, `id_cache.plist`, `facetime.plist`, and keystore set
 
-Do not reuse the same daemon volume for multiple Apple IDs.
+Do not reuse the same daemon data directory for multiple Apple IDs unless the daemon has been refactored to support multiple isolated lines.
 
 ## Hosted Services
 
-Deploy two services:
+Deploy two services for the current single-line setup:
 
 1. `api`
    - public HTTP service
-   - forwards requests to the private daemon
+   - forwards requests to the daemon
 2. `daemon`
-   - private service
    - owns the Apple session and persisted IDS/APS state
+
+For many lines, see [multi-line-backend.md](multi-line-backend.md).
 
 ## Environment
 
@@ -77,7 +77,7 @@ curl -X POST "<api-url>/admin/provision/complete" \
   }'
 ```
 
-The daemon stores session state in its volume. The Apple ID password is only used for the provisioning request.
+The daemon stores session state in its data directory. The Apple ID password is only used for the provisioning request.
 
 ## Verify
 
@@ -127,4 +127,3 @@ Expected FaceTime response includes:
   "join_link": "https://facetime.apple.com/join#..."
 }
 ```
-
