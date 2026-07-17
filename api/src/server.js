@@ -43,6 +43,11 @@ const server = http.createServer(async (req, res) => {
       return json(res, result.status, result.body);
     }
 
+    if (req.method === "GET" && req.url === "/facetime/events") {
+      const result = await forward("/facetime/events", {}, "GET");
+      return json(res, result.status, result.body);
+    }
+
     if (req.method === "POST" && req.url === "/messages") {
       const body = await readJson(req);
       if (typeof body.to !== "string" || typeof body.text !== "string") {

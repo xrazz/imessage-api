@@ -9,6 +9,7 @@ base64 = "0.22"
 keystore = { path = "../vendor/rustpush/keystore" }
 openssl = { version = "0.10.56", features = ["vendored"] }
 plist = "1.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustpush = { path = "../vendor/rustpush", features = ["remote-anisette-v3"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
