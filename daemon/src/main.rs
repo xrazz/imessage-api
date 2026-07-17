@@ -99,6 +99,8 @@ struct CallResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    join_link: Option<String>,
     sender_handle: String,
     recipient_handle: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -674,6 +676,7 @@ async fn facetime_call(
             Json(CallResponse {
                 ok: false,
                 call_id: None,
+                join_link: None,
                 sender_handle: "".to_string(),
                 recipient_handle: payload.to,
                 error: Some("invalid_request"),
@@ -690,6 +693,7 @@ async fn facetime_call(
             Json(CallResponse {
                 ok: false,
                 call_id: None,
+                join_link: None,
                 sender_handle: "".to_string(),
                 recipient_handle: target,
                 error: Some("not_provisioned"),
@@ -716,6 +720,7 @@ async fn facetime_call(
                 Json(CallResponse {
                     ok: false,
                     call_id: None,
+                    join_link: None,
                     sender_handle,
                     recipient_handle: target,
                     error: Some("facetime_unavailable"),
@@ -731,6 +736,7 @@ async fn facetime_call(
                 Json(CallResponse {
                     ok: false,
                     call_id: None,
+                    join_link: None,
                     sender_handle,
                     recipient_handle: target,
                     error: Some("facetime_availability_failed"),
@@ -746,22 +752,38 @@ async fn facetime_call(
         .create_session(call_id.clone(), sender_handle.clone(), &[target.clone()])
         .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(CallResponse {
-                ok: true,
-                call_id: Some(call_id),
-                sender_handle,
-                recipient_handle: target,
-                error: None,
-                message: Some("facetime_call_started".to_string()),
-            }),
-        ),
+        Ok(()) => match runtime.facetime.get_session_link(&call_id).await {
+            Ok(join_link) => (
+                StatusCode::OK,
+                Json(CallResponse {
+                    ok: true,
+                    call_id: Some(call_id),
+                    join_link: Some(join_link),
+                    sender_handle,
+                    recipient_handle: target,
+                    error: None,
+                    message: Some("facetime_call_started".to_string()),
+                }),
+            ),
+            Err(error) => (
+                StatusCode::BAD_GATEWAY,
+                Json(CallResponse {
+                    ok: false,
+                    call_id: Some(call_id),
+                    join_link: None,
+                    sender_handle,
+                    recipient_handle: target,
+                    error: Some("facetime_link_failed"),
+                    message: Some(error.to_string()),
+                }),
+            ),
+        },
         Err(error) => (
             StatusCode::BAD_GATEWAY,
             Json(CallResponse {
                 ok: false,
                 call_id: None,
+                join_link: None,
                 sender_handle,
                 recipient_handle: target,
                 error: Some("facetime_call_failed"),
