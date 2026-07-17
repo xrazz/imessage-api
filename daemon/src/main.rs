@@ -566,13 +566,26 @@ async fn start_facetime_event_watcher(
     let mut receiver = connection.subscribe().await;
     tokio::spawn(async move {
         loop {
-            let message = match receiver.recv().await {
-                Ok(message) => message,
-                Err(error) => {
-                    tracing::warn!("FaceTime event watcher receiver error: {error}");
-                    continue;
-                }
-            };
+            let message =
+                match tokio::time::timeout(std::time::Duration::from_secs(30), receiver.recv())
+                    .await
+                {
+                    Ok(Ok(message)) => message,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            "FaceTime event watcher receiver error: {error}; resubscribing"
+                        );
+                        receiver = connection.subscribe().await;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "FaceTime event watcher idle timeout: {error}; refreshing subscription"
+                        );
+                        receiver = connection.subscribe().await;
+                        continue;
+                    }
+                };
 
             match facetime.handle(message).await {
                 Ok(Some(message)) => {
