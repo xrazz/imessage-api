@@ -10,15 +10,17 @@ use keystore::{
 };
 use openssl::sha::sha256;
 use rustpush::{
-    authenticate_apple, default_provider, login_apple_delegates, macos::MacOSConfig, register,
-    AppleAccount, APSConnection, APSConnectionResource, APSState, ConversationData,
-    DefaultAnisetteProvider, IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, LoginState,
-    MADRID_SERVICE, Message, MessageInst, MessageType, NormalMessage, OSConfig, VerifyBody,
+    authenticate_apple, default_provider,
+    facetime::{FTClient, FTState, FACETIME_SERVICE, VIDEO_SERVICE},
+    login_apple_delegates,
+    macos::MacOSConfig,
+    register, APSConnection, APSConnectionResource, APSState, AppleAccount, ConversationData,
+    DefaultAnisetteProvider, IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, LoginState, Message,
+    MessageInst, MessageType, NormalMessage, OSConfig, VerifyBody, MADRID_SERVICE,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    env,
-    fs,
+    env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -36,6 +38,7 @@ struct AppState {
 
 struct Runtime {
     client: IMClient,
+    facetime: FTClient,
     sender_handle: String,
 }
 
@@ -60,6 +63,11 @@ struct SendRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct CallRequest {
+    to: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TargetRequest {
     to: String,
 }
@@ -80,6 +88,19 @@ struct ApiResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CallResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_id: Option<String>,
+    sender_handle: String,
+    recipient_handle: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,7 +234,9 @@ async fn boot_from_saved_state(data_dir: &Path) -> Result<Option<Runtime>, Strin
         tracing::warn!("APS restored with warning: {error}");
     }
 
-    build_runtime(connection, config, saved, data_dir).await.map(Some)
+    build_runtime(connection, config, saved, data_dir)
+        .await
+        .map(Some)
 }
 
 async fn build_runtime(
@@ -222,18 +245,20 @@ async fn build_runtime(
     saved: SavedState,
     data_dir: &Path,
 ) -> Result<Runtime, String> {
-    let services = &[&MADRID_SERVICE];
+    let services = &[&MADRID_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE];
     let state_path = path(data_dir, "config.plist");
+    let facetime_path = path(data_dir, "facetime.plist");
     let shared_state = Arc::new(std::sync::Mutex::new(saved.clone()));
     let persisted_state = shared_state.clone();
+    let facetime_state: FTState = load_plist(&facetime_path).unwrap_or_default();
 
     let client = IMClient::new(
-        connection,
+        connection.clone(),
         saved.users,
         saved.identity,
         services,
         path(data_dir, "id_cache.plist"),
-        config,
+        config.clone(),
         Box::new(move |updated_users| {
             let mut state = persisted_state.lock().expect("state lock poisoned");
             state.users = updated_users;
@@ -241,6 +266,18 @@ async fn build_runtime(
                 tracing::error!("failed to persist updated IDS users: {error}");
             }
         }),
+    )
+    .await;
+    let facetime = FTClient::new(
+        facetime_state,
+        Box::new(move |state| {
+            if let Err(error) = save_plist(&facetime_path, state) {
+                tracing::error!("failed to persist FaceTime state: {error}");
+            }
+        }),
+        connection,
+        client.identity.clone(),
+        config,
     )
     .await;
 
@@ -254,6 +291,7 @@ async fn build_runtime(
 
     Ok(Runtime {
         client,
+        facetime,
         sender_handle,
     })
 }
@@ -352,7 +390,7 @@ async fn finish_provision(
     register(
         pending.config.as_ref(),
         &*pending.connection.state.read().await,
-        &[&MADRID_SERVICE],
+        &[&MADRID_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
         &mut users,
         &identity,
     )
@@ -368,9 +406,7 @@ async fn finish_provision(
     build_runtime(pending.connection, pending.config, saved, data_dir).await
 }
 
-async fn request_sms_code(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<ApiResponse>) {
+async fn request_sms_code(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
     let mut guard = state.pending_login.lock().await;
     let Some(pending) = guard.as_mut() else {
         return (
@@ -628,6 +664,113 @@ async fn send(
     }
 }
 
+async fn facetime_call(
+    State(state): State<AppState>,
+    Json(payload): Json<CallRequest>,
+) -> (StatusCode, Json<CallResponse>) {
+    if payload.to.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(CallResponse {
+                ok: false,
+                call_id: None,
+                sender_handle: "".to_string(),
+                recipient_handle: payload.to,
+                error: Some("invalid_request"),
+                message: Some("`to` is required".to_string()),
+            }),
+        );
+    }
+    let target = normalize_handle(&payload.to);
+
+    let guard = state.runtime.lock().await;
+    let Some(runtime) = guard.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(CallResponse {
+                ok: false,
+                call_id: None,
+                sender_handle: "".to_string(),
+                recipient_handle: target,
+                error: Some("not_provisioned"),
+                message: Some("daemon needs provisioning first".to_string()),
+            }),
+        );
+    };
+    let sender_handle = choose_sender_handle(runtime, &target).await;
+
+    match runtime
+        .client
+        .identity
+        .validate_targets(
+            &[target.clone()],
+            "com.apple.private.alloy.facetime.multi",
+            &sender_handle,
+        )
+        .await
+    {
+        Ok(valid_targets) if valid_targets.iter().any(|valid| valid == &target) => {}
+        Ok(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(CallResponse {
+                    ok: false,
+                    call_id: None,
+                    sender_handle,
+                    recipient_handle: target,
+                    error: Some("facetime_unavailable"),
+                    message: Some(
+                        "recipient is not available for FaceTime from this sender".to_string(),
+                    ),
+                }),
+            );
+        }
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(CallResponse {
+                    ok: false,
+                    call_id: None,
+                    sender_handle,
+                    recipient_handle: target,
+                    error: Some("facetime_availability_failed"),
+                    message: Some(error.to_string()),
+                }),
+            );
+        }
+    }
+
+    let call_id = Uuid::new_v4().to_string().to_uppercase();
+    match runtime
+        .facetime
+        .create_session(call_id.clone(), sender_handle.clone(), &[target.clone()])
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(CallResponse {
+                ok: true,
+                call_id: Some(call_id),
+                sender_handle,
+                recipient_handle: target,
+                error: None,
+                message: Some("facetime_call_started".to_string()),
+            }),
+        ),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(CallResponse {
+                ok: false,
+                call_id: None,
+                sender_handle,
+                recipient_handle: target,
+                error: Some("facetime_call_failed"),
+                message: Some(error.to_string()),
+            }),
+        ),
+    }
+}
+
 async fn availability(
     State(state): State<AppState>,
     Json(payload): Json<TargetRequest>,
@@ -666,11 +809,7 @@ async fn availability(
     match runtime
         .client
         .identity
-        .validate_targets(
-            &[target.clone()],
-            "com.apple.madrid",
-            &sender_handle,
-        )
+        .validate_targets(&[target.clone()], "com.apple.madrid", &sender_handle)
         .await
     {
         Ok(valid_targets) => {
@@ -793,6 +932,7 @@ async fn main() {
         .route("/provision/sms", post(request_sms_code))
         .route("/provision/complete", post(complete_provision))
         .route("/availability", post(availability))
+        .route("/facetime/call", post(facetime_call))
         .route("/cache/clear", post(clear_cache))
         .route("/reregister", post(reregister))
         .route("/send", post(send))

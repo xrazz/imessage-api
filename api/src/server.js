@@ -74,6 +74,21 @@ const server = http.createServer(async (req, res) => {
       return json(res, result.status, result.body);
     }
 
+    if (req.method === "POST" && req.url === "/facetime/calls") {
+      const body = await readJson(req);
+      if (typeof body.to !== "string") {
+        return json(res, 400, {
+          ok: false,
+          error: "`to` must be a string"
+        });
+      }
+
+      const result = await forward("/facetime/call", {
+        to: body.to
+      });
+      return json(res, result.status, result.body);
+    }
+
     if (req.method === "POST" && req.url === "/admin/provision") {
       const body = await readJson(req);
       if (
