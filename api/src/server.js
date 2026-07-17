@@ -15,11 +15,11 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
-async function forward(path, body) {
+async function forward(path, body, method = "POST") {
   const response = await fetch(`${daemonUrl}${path}`, {
-    method: "POST",
+    method,
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
+    body: method === "GET" ? undefined : JSON.stringify(body)
   });
   const text = await response.text();
   return {
@@ -38,6 +38,11 @@ const server = http.createServer(async (req, res) => {
       return json(res, 401, { ok: false, error: "unauthorized" });
     }
 
+    if (req.method === "GET" && req.url === "/handles") {
+      const result = await forward("/handles", {}, "GET");
+      return json(res, result.status, result.body);
+    }
+
     if (req.method === "POST" && req.url === "/messages") {
       const body = await readJson(req);
       if (typeof body.to !== "string" || typeof body.text !== "string") {
@@ -50,6 +55,21 @@ const server = http.createServer(async (req, res) => {
       const result = await forward("/send", {
         to: body.to,
         text: body.text
+      });
+      return json(res, result.status, result.body);
+    }
+
+    if (req.method === "POST" && req.url === "/availability") {
+      const body = await readJson(req);
+      if (typeof body.to !== "string") {
+        return json(res, 400, {
+          ok: false,
+          error: "`to` must be a string"
+        });
+      }
+
+      const result = await forward("/availability", {
+        to: body.to
       });
       return json(res, result.status, result.body);
     }
@@ -85,6 +105,16 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && req.url === "/admin/provision/sms") {
       const result = await forward("/provision/sms", {});
+      return json(res, result.status, result.body);
+    }
+
+    if (req.method === "POST" && req.url === "/admin/cache/clear") {
+      const result = await forward("/cache/clear", {});
+      return json(res, result.status, result.body);
+    }
+
+    if (req.method === "POST" && req.url === "/admin/reregister") {
+      const result = await forward("/reregister", {});
       return json(res, result.status, result.body);
     }
 

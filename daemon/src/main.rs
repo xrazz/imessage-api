@@ -60,6 +60,11 @@ struct SendRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct TargetRequest {
+    to: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProvisionRequest {
     apple_id: String,
     password: String,
@@ -81,8 +86,77 @@ struct ApiResponse {
     message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct AvailabilityResponse {
+    ok: bool,
+    available: bool,
+    handle: String,
+    sender_handle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HandlesResponse {
+    ok: bool,
+    handles: Vec<String>,
+    phone_handles: Vec<String>,
+    default_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
 fn path(dir: &Path, file: &str) -> PathBuf {
     dir.join(file)
+}
+
+fn normalize_handle(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("mailto:") || trimmed.starts_with("tel:") {
+        return trimmed.to_string();
+    }
+    if trimmed.contains('@') {
+        return format!("mailto:{}", trimmed.to_lowercase());
+    }
+
+    let mut normalized = String::new();
+    for (index, ch) in trimmed.chars().enumerate() {
+        if ch.is_ascii_digit() || (ch == '+' && index == 0) {
+            normalized.push(ch);
+        }
+    }
+
+    if normalized.starts_with('+') {
+        format!("tel:{normalized}")
+    } else if normalized.len() == 10 {
+        format!("tel:+1{normalized}")
+    } else if normalized.len() == 11 && normalized.starts_with('1') {
+        format!("tel:+{normalized}")
+    } else {
+        format!("tel:{normalized}")
+    }
+}
+
+async fn choose_sender_handle(runtime: &Runtime, target: &str) -> String {
+    let handles = runtime.client.identity.get_handles().await;
+    if target.starts_with("tel:") {
+        if let Some(handle) = handles.iter().find(|handle| handle.starts_with("tel:")) {
+            return handle.clone();
+        }
+    }
+
+    if handles.contains(&runtime.sender_handle) {
+        return runtime.sender_handle.clone();
+    }
+
+    handles
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| runtime.sender_handle.clone())
 }
 
 fn load_plist<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
@@ -371,6 +445,43 @@ async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
     })
 }
 
+async fn handles(State(state): State<AppState>) -> (StatusCode, Json<HandlesResponse>) {
+    let guard = state.runtime.lock().await;
+    let Some(runtime) = guard.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HandlesResponse {
+                ok: false,
+                handles: vec![],
+                phone_handles: vec![],
+                default_handle: None,
+                error: Some("not_provisioned"),
+                message: Some("daemon needs provisioning first".to_string()),
+            }),
+        );
+    };
+
+    let handles = runtime.client.identity.get_handles().await;
+    let phone_handles = runtime.client.identity.get_my_phone_handles().await;
+    let default_handle = if handles.contains(&runtime.sender_handle) {
+        Some(runtime.sender_handle.clone())
+    } else {
+        handles.first().cloned()
+    };
+
+    (
+        StatusCode::OK,
+        Json(HandlesResponse {
+            ok: true,
+            handles,
+            phone_handles,
+            default_handle,
+            error: None,
+            message: None,
+        }),
+    )
+}
+
 async fn provision(
     State(state): State<AppState>,
     Json(request): Json<ProvisionRequest>,
@@ -468,6 +579,7 @@ async fn send(
             }),
         );
     }
+    let target = normalize_handle(&payload.to);
 
     let mut guard = state.runtime.lock().await;
     let Some(runtime) = guard.as_mut() else {
@@ -481,15 +593,16 @@ async fn send(
             }),
         );
     };
+    let sender_handle = choose_sender_handle(runtime, &target).await;
 
     let mut message = MessageInst::new(
         ConversationData {
-            participants: vec![payload.to],
+            participants: vec![target],
             cv_name: None,
             sender_guid: Some(Uuid::new_v4().to_string()),
             after_guid: None,
         },
-        &runtime.sender_handle,
+        &sender_handle,
         Message::Message(NormalMessage::new(payload.text, MessageType::IMessage)),
     );
 
@@ -509,6 +622,141 @@ async fn send(
                 ok: false,
                 message_id: None,
                 error: Some("send_failed"),
+                message: Some(error.to_string()),
+            }),
+        ),
+    }
+}
+
+async fn availability(
+    State(state): State<AppState>,
+    Json(payload): Json<TargetRequest>,
+) -> (StatusCode, Json<AvailabilityResponse>) {
+    if payload.to.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AvailabilityResponse {
+                ok: false,
+                available: false,
+                handle: payload.to,
+                sender_handle: "".to_string(),
+                error: Some("invalid_request"),
+                message: Some("`to` is required".to_string()),
+            }),
+        );
+    }
+    let target = normalize_handle(&payload.to);
+
+    let guard = state.runtime.lock().await;
+    let Some(runtime) = guard.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AvailabilityResponse {
+                ok: false,
+                available: false,
+                handle: target,
+                sender_handle: "".to_string(),
+                error: Some("not_provisioned"),
+                message: Some("daemon needs provisioning first".to_string()),
+            }),
+        );
+    };
+    let sender_handle = choose_sender_handle(runtime, &target).await;
+
+    match runtime
+        .client
+        .identity
+        .validate_targets(
+            &[target.clone()],
+            "com.apple.madrid",
+            &sender_handle,
+        )
+        .await
+    {
+        Ok(valid_targets) => {
+            let available = valid_targets.iter().any(|valid| valid == &target);
+            (
+                StatusCode::OK,
+                Json(AvailabilityResponse {
+                    ok: true,
+                    available,
+                    handle: target,
+                    sender_handle,
+                    error: None,
+                    message: None,
+                }),
+            )
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(AvailabilityResponse {
+                ok: false,
+                available: false,
+                handle: target,
+                sender_handle,
+                error: Some("availability_failed"),
+                message: Some(error.to_string()),
+            }),
+        ),
+    }
+}
+
+async fn clear_cache(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let guard = state.runtime.lock().await;
+    let Some(runtime) = guard.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse {
+                ok: false,
+                message_id: None,
+                error: Some("not_provisioned"),
+                message: Some("daemon needs provisioning first".to_string()),
+            }),
+        );
+    };
+
+    runtime.client.identity.invalidate_id_cache().await;
+    (
+        StatusCode::OK,
+        Json(ApiResponse {
+            ok: true,
+            message_id: None,
+            error: None,
+            message: Some("cache_cleared".to_string()),
+        }),
+    )
+}
+
+async fn reregister(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let guard = state.runtime.lock().await;
+    let Some(runtime) = guard.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse {
+                ok: false,
+                message_id: None,
+                error: Some("not_provisioned"),
+                message: Some("daemon needs provisioning first".to_string()),
+            }),
+        );
+    };
+
+    match runtime.client.identity.refresh_now().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                ok: true,
+                message_id: None,
+                error: None,
+                message: Some("reregistered".to_string()),
+            }),
+        ),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiResponse {
+                ok: false,
+                message_id: None,
+                error: Some("reregister_failed"),
                 message: Some(error.to_string()),
             }),
         ),
@@ -540,9 +788,13 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/handles", get(handles))
         .route("/provision", post(provision))
         .route("/provision/sms", post(request_sms_code))
         .route("/provision/complete", post(complete_provision))
+        .route("/availability", post(availability))
+        .route("/cache/clear", post(clear_cache))
+        .route("/reregister", post(reregister))
         .route("/send", post(send))
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
