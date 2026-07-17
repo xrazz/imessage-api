@@ -36,6 +36,7 @@ struct AppState {
     runtime: Arc<Mutex<Option<Runtime>>>,
     pending_login: Arc<Mutex<Option<PendingLogin>>>,
     facetime_events: Arc<Mutex<VecDeque<FaceTimeEvent>>>,
+    current_facetime_call_id: Arc<Mutex<Option<String>>>,
     facetime_webhook_url: Option<String>,
     data_dir: PathBuf,
 }
@@ -248,6 +249,7 @@ fn seed_hwconfig_from_env(data_dir: &Path) -> Result<(), String> {
 async fn boot_from_saved_state(
     data_dir: &Path,
     facetime_events: Arc<Mutex<VecDeque<FaceTimeEvent>>>,
+    current_facetime_call_id: Arc<Mutex<Option<String>>>,
     facetime_webhook_url: Option<String>,
 ) -> Result<Option<Runtime>, String> {
     let Some(config) = load_plist::<MacOSConfig>(&path(data_dir, "hwconfig.plist")) else {
@@ -270,6 +272,7 @@ async fn boot_from_saved_state(
         saved,
         data_dir,
         facetime_events,
+        current_facetime_call_id,
         facetime_webhook_url,
     )
     .await
@@ -282,6 +285,7 @@ async fn build_runtime(
     saved: SavedState,
     data_dir: &Path,
     facetime_events: Arc<Mutex<VecDeque<FaceTimeEvent>>>,
+    current_facetime_call_id: Arc<Mutex<Option<String>>>,
     facetime_webhook_url: Option<String>,
 ) -> Result<Runtime, String> {
     let services = &[&MADRID_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE];
@@ -336,6 +340,7 @@ async fn build_runtime(
         connection,
         facetime.clone(),
         facetime_events,
+        current_facetime_call_id,
         facetime_webhook_url,
     )
     .await;
@@ -557,10 +562,25 @@ async fn publish_facetime_event(
     }
 }
 
+async fn latest_facetime_call_id(facetime: &Arc<FTClient>) -> Option<String> {
+    let state = facetime.state.read().await;
+    state
+        .sessions
+        .iter()
+        .filter_map(|(guid, session)| {
+            session
+                .start_time
+                .map(|start_time| (guid.clone(), start_time))
+        })
+        .max_by_key(|(_, start_time)| *start_time)
+        .map(|(guid, _)| guid)
+}
+
 async fn start_facetime_event_watcher(
     connection: APSConnection,
     facetime: Arc<FTClient>,
     events: Arc<Mutex<VecDeque<FaceTimeEvent>>>,
+    current_call_id: Arc<Mutex<Option<String>>>,
     webhook_url: Option<String>,
 ) {
     let mut receiver = connection.subscribe().await;
@@ -589,6 +609,69 @@ async fn start_facetime_event_watcher(
 
             match facetime.handle(message).await {
                 Ok(Some(message)) => {
+                    match &message {
+                        FTMessage::Ring { guid }
+                        | FTMessage::LinkChanged { guid }
+                        | FTMessage::JoinEvent {
+                            guid, ring: true, ..
+                        }
+                        | FTMessage::AddMembers {
+                            guid, ring: true, ..
+                        } => {
+                            *current_call_id.lock().await = Some(guid.clone());
+                        }
+                        FTMessage::LetMeInRequest(request) => {
+                            let approved_group = current_call_id.lock().await.clone();
+                            let approved_group = match approved_group {
+                                Some(group) => Some(group),
+                                None => latest_facetime_call_id(&facetime).await,
+                            };
+
+                            match facetime
+                                .respond_letmein(request.clone(), approved_group.as_deref())
+                                .await
+                            {
+                                Ok(()) => {
+                                    let join_link = if let Some(group) = approved_group.as_ref() {
+                                        safe_facetime_join_link(&facetime, group).await
+                                    } else {
+                                        None
+                                    };
+                                    let event = FaceTimeEvent {
+                                        id: Uuid::new_v4().to_string(),
+                                        received_at_ms: now_ms(),
+                                        event_type: "facetime.let_me_in_auto_approved".to_string(),
+                                        call_id: approved_group.clone(),
+                                        direction: Some("incoming".to_string()),
+                                        handle: Some(request.requestor.clone()),
+                                        participant: None,
+                                        ring: None,
+                                        join_link,
+                                        message: request.nickname.clone(),
+                                    };
+                                    publish_facetime_event(&events, &webhook_url, event).await;
+                                }
+                                Err(error) => {
+                                    let event = FaceTimeEvent {
+                                        id: Uuid::new_v4().to_string(),
+                                        received_at_ms: now_ms(),
+                                        event_type: "facetime.let_me_in_auto_approve_failed"
+                                            .to_string(),
+                                        call_id: approved_group.clone(),
+                                        direction: Some("incoming".to_string()),
+                                        handle: Some(request.requestor.clone()),
+                                        participant: None,
+                                        ring: None,
+                                        join_link: None,
+                                        message: Some(error.to_string()),
+                                    };
+                                    publish_facetime_event(&events, &webhook_url, event).await;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+
                     let event = facetime_event_from_message(&facetime, message).await;
                     publish_facetime_event(&events, &webhook_url, event).await;
                 }
@@ -604,6 +687,7 @@ async fn finish_provision(
     mut pending: PendingLogin,
     code: String,
     facetime_events: Arc<Mutex<VecDeque<FaceTimeEvent>>>,
+    current_facetime_call_id: Arc<Mutex<Option<String>>>,
     facetime_webhook_url: Option<String>,
 ) -> Result<Runtime, String> {
     let login_state = if let Some(body) = pending.sms_verify_body.take() {
@@ -664,6 +748,7 @@ async fn finish_provision(
         saved,
         data_dir,
         facetime_events,
+        current_facetime_call_id,
         facetime_webhook_url,
     )
     .await
@@ -849,6 +934,7 @@ async fn complete_provision(
         pending,
         request.two_factor_code,
         state.facetime_events.clone(),
+        state.current_facetime_call_id.clone(),
         state.facetime_webhook_url.clone(),
     )
     .await
@@ -1213,6 +1299,7 @@ async fn main() {
     init_file_keystore(&data_dir);
 
     let facetime_event_queue = Arc::new(Mutex::new(VecDeque::new()));
+    let current_facetime_call_id = Arc::new(Mutex::new(None));
     let facetime_webhook_url = env::var("FACETIME_WEBHOOK_URL")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -1220,6 +1307,7 @@ async fn main() {
     let runtime = boot_from_saved_state(
         &data_dir,
         facetime_event_queue.clone(),
+        current_facetime_call_id.clone(),
         facetime_webhook_url.clone(),
     )
     .await
@@ -1229,6 +1317,7 @@ async fn main() {
         runtime: Arc::new(Mutex::new(runtime)),
         pending_login: Arc::new(Mutex::new(None)),
         facetime_events: facetime_event_queue,
+        current_facetime_call_id,
         facetime_webhook_url,
         data_dir,
     };
