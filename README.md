@@ -26,3 +26,4 @@ imessage-api/
 
 - [Setup docs](docs/setup/README.md)
 - [iMessage and FaceTime Q&A](docs/qa/imessage-facetime-qa.md)
+- [FaceTime audio browser bridge](docs/facetime-audio-bridge.md)
