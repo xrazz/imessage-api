@@ -522,6 +522,7 @@ async fn facetime_event_from_message(
         FTMessage::LetMeInRequest(request) => {
             event.event_type = "facetime.let_me_in_request".to_string();
             event.direction = Some("incoming".to_string());
+            event.call_id = facetime_session_for_pseud(facetime, &request.pseud).await;
             event.handle = Some(request.requestor);
             event.message = request.nickname;
         }
@@ -576,6 +577,15 @@ async fn latest_facetime_call_id(facetime: &Arc<FTClient>) -> Option<String> {
         .map(|(guid, _)| guid)
 }
 
+async fn facetime_session_for_pseud(facetime: &Arc<FTClient>, pseud: &str) -> Option<String> {
+    let state = facetime.state.read().await;
+    state
+        .links
+        .get(pseud)
+        .and_then(|link| link.session_link.clone())
+        .filter(|session_link| state.sessions.contains_key(session_link))
+}
+
 async fn start_facetime_event_watcher(
     connection: APSConnection,
     facetime: Arc<FTClient>,
@@ -621,11 +631,17 @@ async fn start_facetime_event_watcher(
                             *current_call_id.lock().await = Some(guid.clone());
                         }
                         FTMessage::LetMeInRequest(request) => {
-                            let approved_group = current_call_id.lock().await.clone();
-                            let approved_group = match approved_group {
-                                Some(group) => Some(group),
-                                None => latest_facetime_call_id(&facetime).await,
-                            };
+                            let approved_group =
+                                match facetime_session_for_pseud(&facetime, &request.pseud).await {
+                                    Some(group) => Some(group),
+                                    None => {
+                                        let current = current_call_id.lock().await.clone();
+                                        match current {
+                                            Some(group) => Some(group),
+                                            None => latest_facetime_call_id(&facetime).await,
+                                        }
+                                    }
+                                };
 
                             match facetime
                                 .respond_letmein(request.clone(), approved_group.as_deref())
